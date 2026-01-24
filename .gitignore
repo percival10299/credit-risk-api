@@ -1,0 +1,16 @@
+# Ignore the Virtual Environment (Thousands of files)
+venv/
+__pycache__/
+
+# Ignore Mac System files
+.DS_Store
+
+# Ignore Data and Models (Too big for GitHub)
+*.csv
+*.pth
+*.pkl
+*.zip
+
+# Ignore the Docker/IDE hidden folders
+.idea/
+.vscode/
