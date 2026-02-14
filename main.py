@@ -1,193 +1,159 @@
 import pandas as pd
 import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+import json
+import warnings
+warnings.filterwarnings('ignore')
 
-# 1. Load Data
-print("Loading data...")
+print("1. Loading main training data...")
 df = pd.read_csv('data/application_train.csv')
-print(f"Original Shape: {df.shape}")
 
+# --- PHASE 1: RELATIONAL DATA AGGREGATION ---
 
-# --- DATA CLEANING ---
+print("2. Aggregating historical bureau.csv data...")
+bureau = pd.read_csv('data/bureau.csv')
+# Group by applicant and calculate statistical summaries of their past loans
+bureau_agg = bureau.groupby('SK_ID_CURR').agg({
+    'SK_ID_BUREAU': 'count',              # Total number of past loans
+    'DAYS_CREDIT': ['min', 'max', 'mean'],# How recently they applied for credit
+    'AMT_CREDIT_SUM': ['sum', 'mean'],    # Total amount they have borrowed in the past
+    'AMT_CREDIT_SUM_DEBT': ['sum', 'mean']# Total amount they currently owe elsewhere
+})
+# Flatten the multi-level columns created by .agg()
+bureau_agg.columns = ['BUREAU_' + '_'.join(c).strip().upper() for c in bureau_agg.columns.values]
+# Merge into main dataframe
+df = df.merge(bureau_agg, on='SK_ID_CURR', how='left')
+del bureau, bureau_agg # Explicitly free RAM
 
-print(df.describe().T)
-print(df.head())
-values = df['DAYS_EMPLOYED'].value_counts()
-print(values)
+print("3. Aggregating previous_application.csv data...")
+prev = pd.read_csv('data/previous_application.csv')
+prev_agg = prev.groupby('SK_ID_CURR').agg({
+    'SK_ID_PREV': 'count',                # Total previous applications at THIS bank
+    'AMT_APPLICATION': ['mean', 'max'],   # How much they asked for previously
+    'CNT_PAYMENT': ['mean', 'sum']        # Length of their previous loan terms
+})
+prev_agg.columns = ['PREV_' + '_'.join(c).strip().upper() for c in prev_agg.columns.values]
+df = df.merge(prev_agg, on='SK_ID_CURR', how='left')
+del prev, prev_agg # Explicitly free RAM
 
-# Fix the anomaly (365243 days employed -> NaN)
+print("3.5 Aggregating installments_payments.csv data (Behavioral Alpha)...")
+installments = pd.read_csv('data/installments_payments.csv')
+
+# 1. Did they pay late? (Positive days = late)
+installments['DAYS_PAST_DUE'] = installments['DAYS_ENTRY_PAYMENT'] - installments['DAYS_INSTALMENT']
+installments['DAYS_PAST_DUE'] = installments['DAYS_PAST_DUE'].apply(lambda x: x if x > 0 else 0)
+
+# 2. Did they underpay?
+installments['PAYMENT_FRACTION'] = installments['AMT_PAYMENT'] / installments['AMT_INSTALMENT']
+
+# THE FIX: Replace 'inf' and '-inf' (caused by division by zero) with NaN
+installments.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+# Group by applicant and extract their payment behavior
+inst_agg = installments.groupby('SK_ID_CURR').agg({
+    'SK_ID_PREV': 'count',                  
+    'DAYS_PAST_DUE': ['max', 'mean', 'sum'],
+    'PAYMENT_FRACTION': ['mean', 'min'],    
+    'AMT_PAYMENT': ['mean', 'sum']          
+})
+
+# Flatten columns and merge
+inst_agg.columns = ['INSTAL_' + '_'.join(c).strip().upper() for c in inst_agg.columns.values]
+df = df.merge(inst_agg, on='SK_ID_CURR', how='left')
+del installments, inst_agg # Free RAM
+
+print("3.7 Aggregating credit_card_balance.csv data...")
+cc = pd.read_csv('data/credit_card_balance.csv')
+cc_agg = cc.groupby('SK_ID_CURR').agg({
+    'AMT_BALANCE': ['mean', 'max'],           # Are they carrying high balances?
+    'AMT_DRAWINGS_CURRENT': ['sum', 'max'],   # Are they pulling cash out constantly?
+    'SK_DPD': ['max', 'sum']                  # Credit Card Days Past Due
+})
+cc_agg.columns = ['CC_' + '_'.join(c).strip().upper() for c in cc_agg.columns.values]
+df = df.merge(cc_agg, on='SK_ID_CURR', how='left')
+del cc, cc_agg # Crucial for saving RAM
+
+print("3.8 Aggregating POS_CASH_balance.csv data...")
+pos = pd.read_csv('data/POS_CASH_balance.csv')
+pos_agg = pos.groupby('SK_ID_CURR').agg({
+    'SK_DPD': ['max', 'mean'],                # Point of Sale Days Past Due
+    'CNT_INSTALMENT_FUTURE': ['mean', 'max']  # How many future installments do they owe?
+})
+pos_agg.columns = ['POS_' + '_'.join(c).strip().upper() for c in pos_agg.columns.values]
+df = df.merge(pos_agg, on='SK_ID_CURR', how='left')
+del pos, pos_agg # Crucial for saving RAM
+# --- PHASE 2: CORE FEATURE ENGINEERING ---
+
+print("4. Engineering financial ratios...")
 df['DAYS_EMPLOYED'] = df['DAYS_EMPLOYED'].replace(365243, np.nan)
 
-# Drop columns that are mostly empty (optional, but speeds things up)
-# If >30% of the data is missing, we drop the column for this baseline
+# Financial Pressure Ratios
+df['CREDIT_TO_INCOME_RATIO'] = df['AMT_CREDIT'] / df['AMT_INCOME_TOTAL']
+df['ANNUITY_TO_INCOME_RATIO'] = df['AMT_ANNUITY'] / df['AMT_INCOME_TOTAL']
+df['CREDIT_TO_ANNUITY_RATIO'] = df['AMT_CREDIT'] / df['AMT_ANNUITY']
+df['DAYS_EMPLOYED_PERCENT'] = df['DAYS_EMPLOYED'] / df['DAYS_BIRTH']
+
+# Family Dynamics Ratios
+df['INCOME_PER_CHILD'] = df['AMT_INCOME_TOTAL'] / (1 + df['CNT_CHILDREN'])
+df['CREDIT_PER_CHILD'] = df['AMT_CREDIT'] / (1 + df['CNT_CHILDREN'])
+
+# Drop empty columns
 df = df.dropna(thresh=0.7*len(df), axis=1)
 
-# Fill Missing Values (Imputation)
-# Select only numeric columns to calculate median
-numeric_cols = df.select_dtypes(include=[np.number]).columns
-df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+# --- PHASE 3: CATEGORICAL OPTIMIZATION ---
 
-# Fill Categorical Missing Values
-# We fill text columns with "Unknown" so they become their own category
+print("5. Converting text to native categories...")
 categorical_cols = df.select_dtypes(include=['object']).columns
-df[categorical_cols] = df[categorical_cols].fillna("Unknown")
+for col in categorical_cols:
+    df[col] = df[col].astype('category')
 
-# Encode Categorical Data (Text -> Numbers)
-print("Encoding categorical data...")
-df = pd.get_dummies(df)
+# --- PHASE 4: PREPARATION & TRAINING ---
 
-# --- END CLEANING ---
-
-print("-" * 30)
-print("Data Cleaned Successfully!")
-print(f"Final Shape: {df.shape}")
-print(f"Remaining NaNs: {df.isnull().sum().sum()}") # Should be 0
-
-# --- PREPARATION FOR MODELING ---
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
-
-# --- STEP 1: PREPARE DATA ---
-print("Preparing X and y...")
-
-# 'TARGET' is what we want to predict (y)
+print("6. Preparing matrices...")
 y = df['TARGET']
+# SK_ID_CURR is an ID, not a predictive feature. We must drop it so the model doesn't learn noise.
+X = df.drop(columns=['TARGET', 'SK_ID_CURR'])
+del df 
 
-# 'X' is everything else (drop TARGET)
-X = df.drop(columns=['TARGET'])
-
-# Free up memory (optional, but good for big datasets)
-del df
-
-# --- STEP 2: SPLIT DATA ---
-# 80% for training, 20% for testing
-print("Splitting data...")
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# --- STEP 3: SCALE DATA ---
-# Logistic Regression requires scaling to work well
-print("Scaling features...")
-scaler = MinMaxScaler()
+scale_pos_weight = (len(y_train) - y_train.sum()) / y_train.sum()
 
-# Learn the scale from training data ONLY, then apply to both
-# (Never learn scale from test data, that is "Data Leakage")
-X_train_scaled = scaler.fit_transform(X_train)
-X_test_scaled = scaler.transform(X_test)
+print("7. Starting Advanced XGBoost Training...")
+model = xgb.XGBClassifier(
+    objective='binary:logistic',
+    eval_metric='auc',
+    scale_pos_weight=scale_pos_weight,
+    learning_rate=0.03,         
+    n_estimators=1500,          
+    max_depth=6,                
+    subsample=0.8,              
+    colsample_bytree=0.8,       
+    tree_method='hist',         
+    enable_categorical=True,    
+    early_stopping_rounds=50,   
+    random_state=42,
+    n_jobs=-1                   
+)
 
+model.fit(
+    X_train, y_train,
+    eval_set=[(X_test, y_test)],
+    verbose=50  # Print progress every 50 trees to watch the climb
+)
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
-from sklearn.metrics import roc_auc_score
+# --- PHASE 5: EVALUATION & EXPORT ---
 
-# --- 1. CONVERT DATA TO TENSORS ---
-# PyTorch requires 'FloatTensors' instead of numpy arrays
-# We use .astype(np.float32) to ensure precision matches
-X_train_tensor = torch.tensor(X_train_scaled.astype(np.float32))
-y_train_tensor = torch.tensor(y_train.values.astype(np.float32)).view(-1, 1)
+print("8. Evaluating final architecture...")
+y_pred_probs = model.predict_proba(X_test)[:, 1]
+score = roc_auc_score(y_test, y_pred_probs)
 
-X_test_tensor = torch.tensor(X_test_scaled.astype(np.float32))
-y_test_tensor = torch.tensor(y_test.values.astype(np.float32)).view(-1, 1)
+print("-" * 40)
+print(f"ULTIMATE PIPELINE ROC AUC Score: {score:.4f}")
+print("-" * 40)
 
-# --- 2. DEFINE THE MODEL ---
-class CreditNeuralNet(nn.Module):
-    def __init__(self, input_dim):
-        super(CreditNeuralNet, self).__init__()
-        
-        # 1. First "Hidden" Layer: Expands the 168 inputs to 64 patterns
-        self.hidden1 = nn.Linear(input_dim, 64)
-        
-        # 2. ReLU Activation: The "Magic" that allows non-linearity
-        self.relu = nn.ReLU()
-        
-        # 3. Output Layer: Compresses the 64 patterns into 1 risk score
-        self.output = nn.Linear(64, 1)
-        
-        # 4. Final Sigmoid: Squashes result to a 0-1 probability
-        self.sigmoid = nn.Sigmoid()
-        
-    def forward(self, x):
-        # Data flows: Linear -> ReLU -> Linear -> Sigmoid
-        x = self.hidden1(x)
-        x = self.relu(x)
-        x = self.output(x)
-        x = self.sigmoid(x)
-        return x
-
-# Initialize Model
-input_features = X_train_tensor.shape[1] # Should be ~168
-model = CreditNeuralNet(input_features)
-
-# --- 3. DEFINE LOSS & OPTIMIZER ---
-# A. Calculate the Weight (SAME AS BEFORE)
-num_pos = y_train.sum()
-num_neg = len(y_train) - num_pos
-# Approx 11.5x multiplier for defaults
-weight_multiplier = num_neg / num_pos 
-
-# B. Create a Weight Tensor for EVERY row (THE FIX)
-# Start by giving everyone a weight of 1.0
-weights = torch.ones_like(y_train_tensor)
-# Find the Defaulters (where y == 1) and change their weight to 11.5
-weights[y_train_tensor == 1] = weight_multiplier
-
-# C. Plug it into the Criterion
-# Now BCELoss knows exactly how important each specific student is
-criterion = nn.BCELoss(weight=weights)
-
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-# --- 4. THE TRAINING LOOP ---
-print("Starting PyTorch Training (Weighted)...")
-epochs = 400
-
-for epoch in range(epochs):
-    # A. Forward Pass
-    outputs = model(X_train_tensor)
-    
-    # B. Calculate Loss
-    # The 'criterion' now automatically applies the 11.5x multiplier 
-    # to any row that is a Defaulter
-    loss = criterion(outputs, y_train_tensor)
-    
-    # C. Backward Pass
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    
-    if (epoch+1) % 100 == 0:
-        print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
-
-# --- 5. EVALUATION ---
-print("Evaluating...")
-model.eval() # Set to evaluation mode
-with torch.no_grad():
-    # Get probabilities
-    y_pred_probs = model(X_test_tensor).numpy()
-    
-    # Calculate Score
-    score = roc_auc_score(y_test, y_pred_probs)
-    print("-" * 30)
-    print(f"PyTorch ROC AUC Score: {score:.4f}")
-    print("-" * 30)
-
-import joblib
-
-# --- 6. SAVE ARTIFACTS FOR PHASE 2 ---
-print("Saving model and scaler...")
-
-# A. Save the PyTorch Model Weights
-torch.save(model.state_dict(), 'credit_model.pth')
-print("Model saved to 'credit_model.pth'")
-
-# B. Save the Scaler (to scale API inputs later)
-joblib.dump(scaler, 'scaler.pkl')
-print("Scaler saved to 'scaler.pkl'")
-
-# C. Save the Feature Columns (Optional but helpful for API)
-# The API needs to know which 168 columns to expect
-import json
-columns_list = list(X.columns)
+model.save_model('credit_xgboost_model.json')
 with open('model_columns.json', 'w') as f:
-    json.dump(columns_list, f)
-print("Column names saved to 'model_columns.json'")
+    json.dump(list(X.columns), f)
