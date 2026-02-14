@@ -90,20 +90,33 @@ X_test_tensor = torch.tensor(X_test_scaled.astype(np.float32))
 y_test_tensor = torch.tensor(y_test.values.astype(np.float32)).view(-1, 1)
 
 # --- 2. DEFINE THE MODEL ---
-class LogisticRegressionPyTorch(nn.Module):
+class CreditNeuralNet(nn.Module):
     def __init__(self, input_dim):
-        super(LogisticRegressionPyTorch, self).__init__()
-        # A single linear layer: y = wx + b
-        self.linear = nn.Linear(input_dim, 1)
+        super(CreditNeuralNet, self).__init__()
+        
+        # 1. First "Hidden" Layer: Expands the 168 inputs to 64 patterns
+        self.hidden1 = nn.Linear(input_dim, 64)
+        
+        # 2. ReLU Activation: The "Magic" that allows non-linearity
+        self.relu = nn.ReLU()
+        
+        # 3. Output Layer: Compresses the 64 patterns into 1 risk score
+        self.output = nn.Linear(64, 1)
+        
+        # 4. Final Sigmoid: Squashes result to a 0-1 probability
+        self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
-        outputs = self.linear(x)
-        # Apply Sigmoid to squash output between 0 and 1
-        return torch.sigmoid(outputs)
+        # Data flows: Linear -> ReLU -> Linear -> Sigmoid
+        x = self.hidden1(x)
+        x = self.relu(x)
+        x = self.output(x)
+        x = self.sigmoid(x)
+        return x
 
 # Initialize Model
 input_features = X_train_tensor.shape[1] # Should be ~168
-model = LogisticRegressionPyTorch(input_features)
+model = CreditNeuralNet(input_features)
 
 # --- 3. DEFINE LOSS & OPTIMIZER ---
 # A. Calculate the Weight (SAME AS BEFORE)
@@ -122,11 +135,11 @@ weights[y_train_tensor == 1] = weight_multiplier
 # Now BCELoss knows exactly how important each specific student is
 criterion = nn.BCELoss(weight=weights)
 
-optimizer = optim.Adam(model.parameters(), lr=0.01)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # --- 4. THE TRAINING LOOP ---
 print("Starting PyTorch Training (Weighted)...")
-epochs = 1000
+epochs = 400
 
 for epoch in range(epochs):
     # A. Forward Pass
